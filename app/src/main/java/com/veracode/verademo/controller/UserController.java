@@ -253,6 +253,11 @@ public class UserController {
 			return "No username provided, please type in your username first";
 		}
 
+		if (!username.matches("^[a-zA-Z0-9_-]{1,30}$")) {
+			logger.warn("Invalid username detected: " + username);
+			return "Invalid username.";
+		}
+
 		try {
 			Class.forName("com.mysql.jdbc.Driver");
 
@@ -314,15 +319,21 @@ public class UserController {
 		logger.info("Entering processRegister");
 		Utils.setSessionUserName(httpRequest, httpResponse, username);
 
+		if (!username.matches("^[a-zA-Z0-9_-]{1,30}$")) {
+			model.addAttribute("error", "Invalid username.");
+			return "register";
+		}
+
 		// Get the Database Connection
 		logger.info("Creating the Database connection");
 		try {
 			Class.forName("com.mysql.jdbc.Driver");
 			Connection connect = DriverManager.getConnection(Constants.create().getJdbcConnectionString());
 
-			String sql = "SELECT username FROM users WHERE username = '" + username + "'";
-			Statement statement = connect.createStatement();
-			ResultSet result = statement.executeQuery(sql);
+			String sql = "SELECT username FROM users WHERE username = ?";
+			PreparedStatement statement = connect.prepareStatement(sql);
+			statement.setString(1, username);
+			ResultSet result = statement.executeQuery();
 			if (result.first()) {
 				model.addAttribute("error", "Username '" + username + "' already exists!");
 				return "register";
@@ -671,14 +682,28 @@ public class UserController {
 
 		logger.info("User is Logged In - continuing... UA=" + request.getHeader("User-Agent") + " U=" + sessionUsername);
 
-		String path = context.getRealPath("/resources/images") + File.separator + imageName;
-
 		logger.info("Fetching profile image: " + path);
 
 		InputStream inputStream = null;
 		OutputStream outStream = null;
 		try {
-			File downloadFile = new File(path);
+			Path baseDirectory = Paths.get(context.getRealPath("/resources/images")).toAbsolutePath().normalize();
+
+			if (!imageName.matches("^[a-zA-Z0-9_-]+\\.(png|jpg|jpeg|gif)$")) {
+				logger.warn("Invalid image name: " + imageName);
+				response.setStatus(HttpServletResponse.SC_BAD_REQUEST);
+				return "error";
+			}
+
+			Path filePath = baseDirectory.resolve(imageName).normalize();
+
+			if (!filePath.startsWith(baseDirectory)) {
+				logger.warn("Attempted path traversal attack: " + filePath);
+				response.setStatus(HttpServletResponse.SC_FORBIDDEN);
+				return "error";
+			}
+
+			File downloadFile = filePath.toFile();
 			inputStream = new FileInputStream(downloadFile);
 
 			// get MIME type of the file
@@ -721,6 +746,91 @@ public class UserController {
 			} catch (IOException ex) {
 				logger.error(ex);
 			}
+		}
+
+		return "profile";
+	}
+
+	@RequestMapping(value = "/downloadprofileimage", method = RequestMethod.GET)
+	public String downloadImage(
+			@RequestParam(value = "image", required = true) String imageName,
+			HttpServletRequest request,
+			HttpServletResponse response) {
+
+		logger.info("Entering downloadImage");
+
+		// Step 1: Ensure user is logged in
+		String sessionUsername = (String) request.getSession().getAttribute("username");
+		if (sessionUsername == null) {
+			logger.info("User is not Logged In - redirecting...");
+			response.setStatus(HttpServletResponse.SC_FORBIDDEN);
+			return Utils.redirect("login?target=profile");
+		}
+
+		logger.info("User is Logged In - continuing... UA=" + request.getHeader("User-Agent") + " U=" + sessionUsername);
+
+		try {
+			// Step 2: Set the secure base directory for image storage
+			Path baseDirectory = Paths.get(context.getRealPath("/resources/images")).toAbsolutePath().normalize();
+
+			// Step 3: Sanitize and validate the image name (only allow alphanumeric, hyphens, and underscores)
+			if (!imageName.matches("^[a-zA-Z0-9_-]+\\.(png|jpg|jpeg|gif)$")) {
+				logger.warn("Invalid image name: " + imageName);
+				response.setStatus(HttpServletResponse.SC_BAD_REQUEST);
+				return "error";
+			}
+
+			// Step 4: Prevent directory traversal by normalizing and checking the path
+			Path filePath = baseDirectory.resolve(imageName).normalize();
+
+			// Step 5: Ensure the file is within the allowed directory
+			if (!filePath.startsWith(baseDirectory)) {
+				logger.warn("Attempted path traversal attack: " + filePath);
+				response.setStatus(HttpServletResponse.SC_FORBIDDEN);
+				return "error";
+			}
+
+			File downloadFile = filePath.toFile();
+
+			// Step 6: Ensure the file exists and is readable
+			if (!downloadFile.exists() || !downloadFile.isFile()) {
+				logger.warn("Requested file does not exist: " + downloadFile.getPath());
+				response.setStatus(HttpServletResponse.SC_NOT_FOUND);
+				return "error";
+			}
+
+			logger.info("Fetching profile image: " + downloadFile.getPath());
+
+			// Step 7: Get MIME type of the file
+			String mimeType = context.getMimeType(downloadFile.getPath());
+			if (mimeType == null) {
+				mimeType = "application/octet-stream";
+			}
+
+			logger.info("MIME type: " + mimeType);
+
+			// Step 8: Write the file to the HTTP response using try-with-resources
+			try (InputStream inputStream = new FileInputStream(downloadFile);
+				 OutputStream outStream = response.getOutputStream()) {
+
+				// Set content attributes for the response
+				response.setContentType(mimeType);
+				response.setContentLength((int) downloadFile.length());
+				response.setHeader("Content-Disposition", "attachment; filename=\"" + imageName + "\"");
+
+				// Write bytes read from the input stream into the output stream
+				byte[] buffer = new byte[4096];
+				int bytesRead;
+				while ((bytesRead = inputStream.read(buffer)) != -1) {
+					outStream.write(buffer, 0, bytesRead);
+				}
+
+				outStream.flush();
+			}
+
+		} catch (IllegalArgumentException | IOException ex) {
+			logger.error("Error occurred while downloading image: ", ex);
+			response.setStatus(HttpServletResponse.SC_INTERNAL_SERVER_ERROR);
 		}
 
 		return "profile";
